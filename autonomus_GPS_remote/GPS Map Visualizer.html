@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>GPS Map Visualization</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        #map {
+            height: 90vh;
+        }
+
+        .controls {
+            position: absolute;
+            top: 10px;
+            left: 60px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0);
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        button {
+            margin: 5px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <div class="controls">
+        <div>
+            <label><input type="checkbox" id="logCurrent"> Current</label><br>
+            <label><input type="checkbox" id="logTarget"> Target</label><br>
+            <label><input type="checkbox" id="logRemote"> Remote</label><br><br>
+        </div>
+        <div>
+            <button id="startBtn">Start Logging</button>
+            <button id="stopBtn">Stop Logging</button>
+            <button id="clearBtn">Clear Selected Trail</button>
+            <button id="exportBtn">Export Selected Waypoints</button>
+            <button id="toggleBtn">Toggle Trails Visibility</button>
+        </div>
+        <div>
+            <button id="connectBtn" type="button">Connect Serial</button>
+            <button id="disconnectBtn" type="button" disabled>Close Serial</button>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        let map = L.map('map').setView([0, 0], 5);
+
+        // CartoDB Positron
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+            maxZoom: 22,
+            attribution: '&copy; OpenStreetMap contributors & CartoDB'
+        }).addTo(map);
+
+        let markersLayer = L.layerGroup().addTo(map); // Group to hold all markers
+
+        map.on('click', function (e) {
+            // Prompt for a name
+            const markerName = prompt("Enter a name for this marker:");
+            if (markerName) {
+                // Create marker
+                const marker = L.marker(e.latlng, { draggable: true })
+                    .addTo(markersLayer)
+                    .bindPopup(markerName + " (Click marker to remove)")
+                    .openPopup();
+
+                // Add click event to the marker itself for removal
+                marker.on('click', function () {
+                    markersLayer.removeLayer(marker);
+                });
+            }
+        });
+
+        // Custom icons
+        const currentIcon = L.icon({
+            iconUrl: 'https://maps.google.com/mapfiles/ms/icons/blue-dot.png',
+            iconSize: [32, 32],
+            iconAnchor: [16, 32],
+        });
+        const targetIcon = L.icon({
+            iconUrl: 'https://maps.google.com/mapfiles/ms/icons/red-dot.png',
+            iconSize: [32, 32],
+            iconAnchor: [16, 32],
+        });
+        const remoteIcon = L.icon({
+            iconUrl: 'https://maps.google.com/mapfiles/ms/icons/green-dot.png',
+            iconSize: [32, 32],
+            iconAnchor: [16, 32],
+        });
+
+        // Markers
+        let markers = {
+            current: L.marker([0, 0], { icon: currentIcon }).addTo(map).bindPopup("Current Location"),
+            target: L.marker([0, 0], { icon: targetIcon }).addTo(map).bindPopup("Target Location"),
+            remote: L.marker([0, 0], { icon: remoteIcon }).addTo(map).bindPopup("Remote Location")
+        };
+
+        // Polylines and Waypoints
+        let trails = {
+            current: { line: L.polyline([], { color: 'blue' }).addTo(map), points: [], visible: true },
+            target: { line: L.polyline([], { color: 'red' }).addTo(map), points: [], visible: true },
+            remote: { line: L.polyline([], { color: 'green' }).addTo(map), points: [], visible: true }
+        };
+
+        let mapCentered = false;
+        let port, reader;
+        let buffer = "";
+
+        let logging = false;
+
+        document.getElementById('connectBtn').addEventListener('click', async () => {
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+
+                const decoder = new TextDecoderStream();
+                port.readable.pipeTo(decoder.writable);
+                reader = decoder.readable.getReader();
+                readLoop();
+
+                document.getElementById('disconnectBtn').disabled = false;
+                document.getElementById('connectBtn').disabled = true;
+            } catch (err) {
+                console.error('Serial connection error:', err);
+            }
+        });
+
+        document.getElementById('disconnectBtn').addEventListener('click', async () => {
+            try {
+                if (reader) await reader.cancel();
+                if (port) await port.close();
+
+                document.getElementById('disconnectBtn').disabled = true;
+                document.getElementById('connectBtn').disabled = false;
+
+                console.log('Serial port closed');
+            } catch (err) {
+                console.error('Error closing serial port:', err);
+            }
+        });
+
+        const checkboxes = {
+            current: document.getElementById('logCurrent'),
+            target: document.getElementById('logTarget'),
+            remote: document.getElementById('logRemote')
+        };
+
+        document.getElementById('startBtn').addEventListener('click', () => logging = true);
+        document.getElementById('stopBtn').addEventListener('click', () => logging = false);
+
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            for (let key in trails) {
+                if (checkboxes[key].checked) {
+                    trails[key].line.setLatLngs([]);
+                    trails[key].points = [];
+                }
+            }
+        });
+
+        document.getElementById('toggleBtn').addEventListener('click', () => {
+            for (let key in trails) {
+                if (checkboxes[key].checked) {
+                    trails[key].visible = !trails[key].visible;
+                    if (trails[key].visible) {
+                        trails[key].line.addTo(map);
+                    } else {
+                        map.removeLayer(trails[key].line);
+                    }
+                }
+            }
+        });
+
+        document.getElementById('exportBtn').addEventListener('click', () => {
+            for (let key in trails) {
+                if (checkboxes[key].checked) {
+                    const dataStr = JSON.stringify(trails[key].points, null, 2);
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                    const blob = new Blob([dataStr], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${key}_waypoints_${timestamp}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            }
+        });
+
+        async function readLoop() {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) {
+                    console.log('Reader closed');
+                    break;
+                }
+                if (value) {
+                    buffer += value;
+                    if (buffer.includes('Waypoint counter')) {
+                        parseSerialData(buffer);
+                        buffer = "";
+                    }
+                }
+            }
+        }
+
+        function parseSerialData(data) {
+            console.log('Received:\n', data);
+            const lines = data.split('\n');
+            let parsed = {};
+
+            lines.forEach(line => {
+                let parts = line.split(':');
+                if (parts.length >= 2) {
+                    const key = parts[0].trim();
+                    const value = parts.slice(1).join(':').trim().split(' ')[0];
+                    parsed[key] = value;
+                }
+            });
+
+            const currentLat = parseFloat(parsed["Current Latitude"]);
+            const currentLon = parseFloat(parsed["Current Longitude"]);
+            const targetLat = parseFloat(parsed["Target Latitude"]);
+            const targetLon = parseFloat(parsed["Target Longitude"]);
+            const remoteLat = parseFloat(parsed["Remote Latitude"]);
+            const remoteLon = parseFloat(parsed["Remote Longitude"]);
+
+            if (!isNaN(currentLat) && !isNaN(currentLon)) {
+                markers.current.setLatLng([currentLat, currentLon]);
+                if (!mapCentered) {
+                    map.setView([currentLat, currentLon], map.getZoom());
+                    mapCentered = true;
+                }
+                if (logging && checkboxes.current.checked) {
+                    trails.current.points.push({ currentLat, currentLon });
+                    trails.current.line.addLatLng([currentLat, currentLon]);
+                }
+            }
+            if (!isNaN(targetLat) && !isNaN(targetLon) && (targetLat !== 0.0 || targetLon !== 0.0)) {
+                markers.target.setLatLng([targetLat, targetLon]);
+                if (logging && checkboxes.target.checked) {
+                    trails.target.points.push({ targetLat, targetLon });
+                    trails.target.line.addLatLng([targetLat, targetLon]);
+                }
+            }
+            if (!isNaN(remoteLat) && !isNaN(remoteLon)) {
+                markers.remote.setLatLng([remoteLat, remoteLon]);
+                if (logging && checkboxes.remote.checked) {
+                    trails.remote.points.push({ remoteLat, remoteLon });
+                    trails.remote.line.addLatLng([remoteLat, remoteLon]);
+                }
+            }
+        }
+
+        // let rData = {
+        //     latitude: 12.9716,
+        //     longitude: 77.5946,
+        //     targetlatitude: 12.9720,
+        //     targetlongitude: 77.5950
+        // };
+
+        // let Current = {
+        //     latitude: 25.43,
+        //     longitude: 25.43
+        // };
+
+        //         setInterval(() => {
+        //             Current.latitude = 25.43 + (Math.random() - 0.5) * 0.01;
+        //             Current.longitude = 81.77 + (Math.random() - 0.5) * 0.01;
+        //             rData.latitude = Current.latitude + 0.002;
+        //             rData.longitude = Current.longitude + 0.002;
+        //             rData.targetlatitude = Current.latitude - 0.002;
+        //             rData.targetlongitude = Current.longitude - 0.002;
+
+        //             let output = `\n\nMode: 1
+        // Target Heading: 90
+        // Current Heading: 90
+        // Current Distance: 1
+        // Current Latitude: ${rData.latitude.toFixed(6)}
+        // Current Longitude: ${rData.longitude.toFixed(6)}
+        // Target Latitude: ${rData.targetlatitude.toFixed(6)}
+        // Target Longitude: ${rData.targetlongitude.toFixed(6)}
+        // Remote Latitude: ${Current.latitude.toFixed(6)}
+        // Remote Longitude: ${Current.longitude.toFixed(6)}`;
+
+        //             console.log(output);
+
+        //             parseSerialData(output);
+        //         }, 1000);
+
+        // setInterval(() => {
+        //     const lat = 25.43 + (Math.random() - 0.5) * 0.01;
+        //     const lon = 81.77 + (Math.random() - 0.5) * 0.01;
+
+        //     markers.current.setLatLng([lat, lon]);
+        //     markers.remote.setLatLng([lat + 0.002, lon + 0.002]);
+        //     markers.target.setLatLng([lat - 0.002, lon - 0.002]);
+
+        //     if (logging && selected === 'current') {
+        //         trails.current.points.push({ lat, lon });
+        //         trails.current.line.addLatLng([lat, lon]);
+        //     }
+        //     if (logging && selected === 'remote') {
+        //         trails.remote.points.push({ lat, lon });
+        //         trails.remote.line.addLatLng([lat, lon]);
+        //     }
+        //     if (logging && selected === 'target') {
+        //         trails.target.points.push({ lat, lon });
+        //         trails.target.line.addLatLng([lat, lon]);
+        //     }
+
+        // }, 1000);
+    </script>
+</body>
+
+</html>
